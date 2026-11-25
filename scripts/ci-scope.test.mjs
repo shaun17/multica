@@ -5,7 +5,7 @@ import { dirname, join, matchesGlob, posix, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
-import { checkGate, decideScopes, filters } from "./ci-scope.mjs";
+import { checkGate, decideScopes, filters, upstreamRepository } from "./ci-scope.mjs";
 
 // The filters use only literal paths, * and **; Node's matcher exercises those
 // against realistic changes, including files removed or renamed by a PR.
@@ -82,6 +82,38 @@ test("scheduled and manual runs select every scope without a path-filter result"
   }
 });
 
+test("forks leave macOS jobs unselected and still block on a real failure", () => {
+  assert.equal(upstreamRepository, "multica-ai/multica");
+  const fork = "shaun17/multica";
+  for (const event of ["schedule", "workflow_dispatch"]) {
+    const outputs = decideScopes(event, {}, fork);
+    assert.equal(outputs.macos, "false");
+    assert.equal(outputs.full, "false");
+    assert.equal(outputs.processtree, "false");
+    assert.equal(outputs.backend, "true");
+    assert.equal(outputs.installer, "true");
+    assert.equal(outputs.runtime, "true");
+    const needs = productionNeeds("backend", outputs);
+    assert.equal(needs["macos-runtime"].result, "skipped");
+    assert.equal(needs["macos-processtree"].result, "skipped");
+    assert.equal(needs.installer.result, "success");
+    checkGate(needs, productionMapping("backend"));
+    const failedScan = productionNeeds("backend", outputs);
+    failedScan["go-vulnerability-scan"].result = "failure";
+    assert.throws(() => checkGate(failedScan, productionMapping("backend")), /go-vulnerability-scan/);
+    const failedMac = productionNeeds("backend", outputs);
+    failedMac["macos-runtime"].result = "failure";
+    assert.throws(() => checkGate(failedMac, productionMapping("backend")), /macos-runtime/);
+  }
+  const touched = filterFiles(["server/internal/daemon/processtree/controller_unix.go"]);
+  const pullRequest = decideScopes("pull_request", touched, fork);
+  assert.equal(pullRequest.macos, "false");
+  assert.equal(pullRequest.processtree, "false");
+  assert.equal(pullRequest.backend, "true");
+  assert.equal(decideScopes("pull_request", touched).processtree, "true");
+  assert.equal(decideScopes("schedule", {}, upstreamRepository).macos, "true");
+});
+
 test("missing, malformed and unsupported filter results fail closed", () => {
   for (const value of [undefined, "", "unknown", true]) {
     assert.throws(() => decideScopes("push", { ...filterFiles([]), backend: value }), /backend/);
@@ -145,7 +177,7 @@ for (const gate of ["frontend", "backend"]) {
       const outputs = job === "frontend-quality"
         ? decideScopes("pull_request", filterFiles(["apps/docs/content/guide.mdx"]))
         : decideScopes("workflow_dispatch", {});
-      for (const result of ["failure", "cancelled", "skipped", undefined]) {
+      for (const result of ["failure", "cancelled", "skipped", "abandoned", undefined]) {
         const input = productionNeeds(gate, outputs);
         assert.equal(input[job].result, "success");
         input[job].result = result;
@@ -160,7 +192,7 @@ for (const gate of ["frontend", "backend"]) {
   test(`production ${gate} gate rejects invalid filtering and unchecked dependencies`, () => {
     const mapping = productionMapping(gate);
     const unselected = () => productionNeeds(gate, decideScopes("pull_request", filterFiles([])));
-    for (const result of ["failure", "cancelled", "skipped", undefined]) {
+    for (const result of ["failure", "cancelled", "skipped", "abandoned", undefined]) {
       const input = unselected();
       input.changes.result = result;
       assert.throws(() => checkGate(input, mapping), /Path filtering/);
@@ -183,6 +215,14 @@ for (const gate of ["frontend", "backend"]) {
 
 // The gates trust job results, and continue-on-error reports a failed step as
 // a success, so a gate cannot see a failure behind it.
+test("forks do not request a macOS installer runner", () => {
+  assert.match(jobs.changes, /^      macos: \$\{\{ steps\.decide\.outputs\.macos \}\}$/m);
+  assert.match(jobs.changes, /^          GITHUB_REPOSITORY: \$\{\{ github\.repository \}\}$/m);
+  assert.match(jobs.installer, /needs\.changes\.outputs\.macos == 'true'/);
+  assert.equal(field(jobs["macos-runtime"], /^    if: \$\{\{ needs\.changes\.outputs\.(\w+) == 'true' \}\}$/m), "full");
+  assert.equal(field(jobs["macos-processtree"], /^    if: \$\{\{ needs\.changes\.outputs\.(\w+) == 'true' \}\}$/m), "processtree");
+});
+
 test("no gated job or shared quality step continues past a failure", () => {
   const action = readFileSync(new URL("../.github/actions/frontend-quality/action.yml", import.meta.url), "utf8");
   assert.doesNotMatch(workflow, /continue-on-error:/);
@@ -237,6 +277,24 @@ test("the CLI writes real Actions outputs and exits nonzero on a failed gate", (
   });
   assert.equal(run.status, 0, run.stderr);
   assert.match(readFileSync(output, "utf8"), /^backend=false$/m);
+  const forkOutput = join(dir, "fork-output");
+  const fork = spawnSync(process.execPath, [script, "decide"], {
+    env: {
+      ...process.env,
+      EVENT_NAME: "schedule",
+      FILTER_RESULTS: "{}",
+      GITHUB_REPOSITORY: "shaun17/multica",
+      GITHUB_OUTPUT: forkOutput,
+    },
+    encoding: "utf8",
+  });
+  assert.equal(fork.status, 0, fork.stderr);
+  const forkText = readFileSync(forkOutput, "utf8");
+  assert.match(forkText, /^macos=false$/m);
+  assert.match(forkText, /^full=false$/m);
+  assert.match(forkText, /^processtree=false$/m);
+  assert.match(forkText, /^backend=true$/m);
+  assert.match(forkText, /^installer=true$/m);
   const failed = productionNeeds("backend", decideScopes("workflow_dispatch", {}));
   failed["backend-tests"].result = "failure";
   const gate = spawnSync(process.execPath, [script, "gate"], {

@@ -7,7 +7,15 @@ export const filters = JSON.parse(
   readFileSync(new URL("../.github/ci-paths.json", import.meta.url), "utf8"),
 );
 
-export function decideScopes(event, filtered) {
+// Parent of this fork, from the repository metadata. Hosted macOS arm64
+// runners are often never assigned outside this repository; the job is then
+// `abandoned` and the backend gate fails even though no test ran. `full` is
+// only the macos-runtime scope, and `processtree` is only the macOS
+// process-group job. The installer matrix reads `macos` so its Linux and
+// Windows legs still run.
+export const upstreamRepository = "multica-ai/multica";
+
+export function decideScopes(event, filtered, repository = upstreamRepository) {
   const full = event === "schedule" || event === "workflow_dispatch";
   if (!full && event !== "push" && event !== "pull_request") {
     throw new Error(`Unsupported CI event: ${event}`);
@@ -22,6 +30,12 @@ export function decideScopes(event, filtered) {
   // Product builds already install dependencies and run the shared checks.
   // Only allocate a separate runner when quality is the sole frontend work.
   outputs.quality_only = String(outputs.quality === "true" && outputs.frontend === "false");
+  const macos = repository === upstreamRepository;
+  outputs.macos = String(macos);
+  if (!macos) {
+    outputs.full = "false";
+    outputs.processtree = "false";
+  }
   return outputs;
 }
 
@@ -51,7 +65,8 @@ if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToP
   try {
     switch (process.argv[2]) {
       case "decide": {
-        const outputs = decideScopes(process.env.EVENT_NAME, JSON.parse(process.env.FILTER_RESULTS));
+        const repository = process.env.GITHUB_REPOSITORY || upstreamRepository;
+        const outputs = decideScopes(process.env.EVENT_NAME, JSON.parse(process.env.FILTER_RESULTS), repository);
         appendFileSync(process.env.GITHUB_OUTPUT,
           Object.entries(outputs).map(([key, value]) => `${key}=${value}\n`).join(""));
         break;
